@@ -109,6 +109,11 @@ MISSIONS = {
     },
 }
 
+# --- Crack Segmentation (environmental detection) ---
+YOLO_CRACK_SEG_ONNX_PATH = "models/yolov8_crack_seg.onnx"
+YOLO_CRACK_ENABLED = True
+YOLO_CRACK_CONFIDENCE_THRESHOLD = 0.35
+
 # --- Server ---
 API_HOST = "0.0.0.0"
 API_PORT = 8000

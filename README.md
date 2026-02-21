@@ -95,11 +95,32 @@ cd ../..
 
 ---
 
+## Crack segmentation (environmental detection)
+
+Detects cracks in roads/walls using [OpenSistemas/YOLOv8-crack-seg](https://huggingface.co/OpenSistemas/YOLOv8-crack-seg). Crack detections appear as class **"crack"** alongside standard YOLO detections on the live view and tactical map (orange-red bounding boxes).
+
+**Download the model:**
+
+```bash
+pip install ultralytics huggingface_hub
+python scripts/download_model_crack_seg.py          # default: yolov8n (fastest)
+python scripts/download_model_crack_seg.py --variant yolov8s  # or yolov8m/l/x
+```
+
+The ONNX model is saved to `models/yolov8_crack_seg.onnx`. Both backends load it automatically at startup when the file exists and `YOLO_CRACK_ENABLED` is `True` in config.
+
+**Disable:** Set `YOLO_CRACK_ENABLED = False` in `config.py` / `backend/config.py`, or set env var `CRACK_ENABLED=0`.
+
+---
+
 ## Project layout
 
 | Path                  | Description |
 |-----------------------|-------------|
 | `Drone/frontend`      | Cipher React UI (Vite). |
 | `Drone/local_backend` | Backend (FastAPI, webcam, YOLO, Agent). |
+| `crack/`              | Crack segmentation package (detector, config, download). |
+| `models/`             | ONNX models (`yolov8_det.onnx`, `yolov8_crack_seg.onnx`). |
+| `scripts/`            | Download scripts for models. |
 | `run_drone_full.ps1`  | Start backend + frontend. |
 | `start_backend.ps1`   | Start backend only. |

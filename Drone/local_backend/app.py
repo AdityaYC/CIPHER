@@ -386,6 +386,8 @@ phantom_state = {
 phantom_camera_manager = None
 phantom_yolo_detector = None
 _phantom_model_path = _DRONE2_ROOT / "models" / "yolov8_det.onnx"
+_phantom_crack_path = _DRONE2_ROOT / "models" / "yolov8_crack_seg.onnx"
+phantom_crack_detector = None  # YOLOCrackSegDetector, loaded at startup
 
 # Simple laptop camera when Drone2 stack is not loaded (no PYTHONPATH or model missing)
 _simple_capture = None
@@ -530,6 +532,12 @@ async def phantom_background_loop():
                     else:
                         # Fallback: Drone's YOLO (CPU) when Drone2 ONNX not loaded
                         detections = _run_drone_yolo_on_frame(frame)
+                    # Crack segmentation: merge environmental detections
+                    if phantom_crack_detector is not None:
+                        try:
+                            detections.extend(phantom_crack_detector.detect(frame))
+                        except Exception:
+                            pass
                     h, w = frame.shape[:2]
                     mapped = p["detection_mapper"].map_detections(drone_id, detections, w, h)
                     phantom_state["detections"][drone_id] = mapped
@@ -541,9 +549,10 @@ async def phantom_background_loop():
                         x1, y1, x2, y2 = [int(round(x)) for x in bbox]
                         cls = d.get("class", "?")
                         conf = d.get("confidence", 0)
-                        p["cv2"].rectangle(vis, (x1, y1), (x2, y2), (0, 255, 102), 2)
+                        color = (0, 80, 255) if cls == "crack" else (0, 255, 102)
+                        p["cv2"].rectangle(vis, (x1, y1), (x2, y2), color, 2)
                         label = f"{cls} {conf:.0%}"
-                        p["cv2"].putText(vis, label, (x1, y1 - 6), p["cv2"].FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 102), 1)
+                        p["cv2"].putText(vis, label, (x1, y1 - 6), p["cv2"].FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
                     _, jpeg = p["cv2"].imencode(".jpg", vis)
                     phantom_state["processed_frames"][drone_id] = jpeg.tobytes()
                 except Exception:
@@ -579,6 +588,12 @@ async def _simple_yolo_loop():
             frame = _simple_camera_frame.copy()
             h, w = frame.shape[:2]
             detections = _run_drone_yolo_on_frame(frame)
+            # Crack segmentation: merge environmental detections
+            if phantom_crack_detector is not None:
+                try:
+                    detections.extend(phantom_crack_detector.detect(frame))
+                except Exception:
+                    pass
             phantom_state["raw_detections"] = list(detections)
             phantom_state["npu_provider"] = "CPUExecutionProvider"
             phantom_state["yolo_latency_ms"] = 0.0
@@ -593,8 +608,9 @@ async def _simple_yolo_loop():
                 x1, y1, x2, y2 = [int(round(x)) for x in bbox]
                 cls = d.get("class", "?")
                 conf = d.get("confidence", 0)
-                cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 102), 2)
-                cv2.putText(vis, f"{cls} {conf:.0%}", (x1, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 102), 1)
+                color = (0, 80, 255) if cls == "crack" else (0, 255, 102)
+                cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(vis, f"{cls} {conf:.0%}", (x1, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
             _, jpeg = cv2.imencode(".jpg", vis)
             phantom_state["processed_frames"]["Drone-1"] = jpeg.tobytes()
             phantom_state["processed_frames"]["Drone-2"] = jpeg.tobytes()
@@ -642,7 +658,7 @@ async def _world_graph_ingest_loop():
 @app.on_event("startup")
 async def startup_event():
     """Load data on startup. Always try laptop webcam first (as in original Drone setup)."""
-    global phantom_camera_manager, phantom_yolo_detector, _simple_capture, _placeholder_jpeg
+    global phantom_camera_manager, phantom_yolo_detector, phantom_crack_detector, _simple_capture, _placeholder_jpeg
     try:
         image_db.load()
     except Exception as e:
@@ -718,6 +734,28 @@ async def startup_event():
         asyncio.create_task(_simple_yolo_loop())
         print("  YOLO: Drone CPU (on laptop feed)")
 
+    # 2b) Crack segmentation model (environmental detection)
+    _crack_enabled = getattr(_phantom.get("config") if _phantom else None, "YOLO_CRACK_ENABLED", True) if _phantom else True
+    if _crack_enabled and _phantom_crack_path.exists():
+        try:
+            from crack.detector import YOLOCrackSegDetector
+            _qnn = getattr(_phantom["config"], "QNN_DLL_PATH", None) if _phantom else None
+            _crack_conf = getattr(_phantom["config"], "YOLO_CRACK_CONFIDENCE_THRESHOLD", 0.35) if _phantom else 0.35
+            phantom_crack_detector = YOLOCrackSegDetector(
+                str(_phantom_crack_path),
+                qnn_dll_path=_qnn,
+                confidence_threshold=_crack_conf,
+            )
+            print(f"  Crack-seg: loaded ({phantom_crack_detector.get_provider()})")
+        except Exception as e:
+            print(f"  Crack-seg: not loaded ({e})")
+            phantom_crack_detector = None
+    else:
+        if not _crack_enabled:
+            print("  Crack-seg: disabled")
+        elif not _phantom_crack_path.exists():
+            print(f"  Crack-seg: model not found at {_phantom_crack_path}")
+
     # 3) World graph for tactical map: ingest laptop feed so map has nodes
     if _world_graph is not None and _simple_capture is not None and _simple_capture.isOpened():
         asyncio.create_task(_world_graph_ingest_loop())
@@ -735,7 +773,8 @@ async def startup_event():
     # Summary so you can see why webcam/YOLO might not show
     cam_ok = _simple_capture is not None and _simple_capture.isOpened()
     yolo_ok = phantom_yolo_detector is not None or getattr(models, "yolo", None) is not None
-    print(f"  >>> Backend ready. Webcam: {'OK' if cam_ok else 'NOT OPEN'}. YOLO: {'OK' if yolo_ok else 'NOT LOADED (pip install ultralytics?)'}")
+    crack_ok = phantom_crack_detector is not None
+    print(f"  >>> Backend ready. Webcam: {'OK' if cam_ok else 'NOT OPEN'}. YOLO: {'OK' if yolo_ok else 'NOT LOADED'}. Crack-seg: {'OK' if crack_ok else 'OFF'}")
 
 
 @app.get("/getImage")

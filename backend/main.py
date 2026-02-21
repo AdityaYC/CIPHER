@@ -32,6 +32,10 @@ logger = logging.getLogger(__name__)
 
 # Resolve paths relative to project root (only Drone UI is used)
 _model_path = os.path.join(_project_root, "models", "yolov8_det.onnx")
+_crack_model_path = os.path.join(
+    _project_root,
+    getattr(config, "YOLO_CRACK_SEG_ONNX_PATH", "models/yolov8_crack_seg.onnx"),
+)
 _drone_frontend_dir = os.path.join(_project_root, "Drone", "frontend", "dist")
 _ssl_dir = os.path.join(_project_root, "ssl")
 _ssl_certfile = os.path.join(_ssl_dir, "cert.pem")
@@ -70,6 +74,7 @@ state = {
 
 camera_manager: CameraManager | None = None
 yolo_detector: YOLODetector | None = None
+crack_detector = None  # YOLOCrackSegDetector, loaded at startup if model exists
 
 
 def _run_llm_sync(summary: str, mission: str) -> str:
@@ -109,6 +114,15 @@ async def background_loop():
                         state["yolo_latency_ms"] = yolo_detector.get_last_latency()
                     else:
                         detections = []
+
+                    # Crack segmentation: merge environmental detections
+                    if crack_detector is not None:
+                        try:
+                            crack_dets = crack_detector.detect(frame)
+                            detections.extend(crack_dets)
+                        except Exception as ce:
+                            logger.debug(f"Crack detection error [{drone_id}]: {ce}")
+
                     h, w = frame.shape[:2]
                     mapped = detection_mapper.map_detections(drone_id, detections, w, h)
                     state["detections"][drone_id] = mapped
@@ -122,9 +136,11 @@ async def background_loop():
                         x1, y1, x2, y2 = [int(round(x)) for x in bbox]
                         cls = d.get("class", "?")
                         conf = d.get("confidence", 0)
-                        cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 102), 2)
+                        # Crack detections use orange-red; standard YOLO uses green
+                        color = (0, 80, 255) if cls == "crack" else (0, 255, 102)
+                        cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
                         label = f"{cls} {conf:.0%}"
-                        cv2.putText(vis, label, (x1, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 102), 1)
+                        cv2.putText(vis, label, (x1, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
                     _, jpeg = cv2.imencode(".jpg", vis)
                     state["processed_frames"][drone_id] = jpeg.tobytes()
                 except Exception as e:
@@ -487,7 +503,7 @@ async def api_voice_query(request: Request):
 
 @app.on_event("startup")
 async def startup():
-    global camera_manager, yolo_detector
+    global camera_manager, yolo_detector, crack_detector
     # Vector DB: load emergency manuals from /data (local, no cloud)
     try:
         from vector_db import load_manuals_from_data_dir
@@ -512,6 +528,27 @@ async def startup():
             logger.error(f"YOLO init failed: {e}")
             print("  WARNING: YOLO not loaded. Run with ONNX model in models/ for detection.")
             yolo_detector = None
+
+    # Crack segmentation model (environmental detection)
+    _crack_enabled = getattr(config, "YOLO_CRACK_ENABLED", True)
+    if _crack_enabled and os.path.isfile(_crack_model_path):
+        try:
+            from crack.detector import YOLOCrackSegDetector
+            crack_detector = YOLOCrackSegDetector(
+                _crack_model_path,
+                qnn_dll_path=config.QNN_DLL_PATH,
+                confidence_threshold=getattr(config, "YOLO_CRACK_CONFIDENCE_THRESHOLD", 0.35),
+            )
+            print(f"  Crack-seg: loaded ({crack_detector.get_provider()})")
+        except Exception as e:
+            logger.warning(f"Crack-seg init failed: {e}")
+            print(f"  Crack-seg: not loaded ({e})")
+            crack_detector = None
+    else:
+        if not _crack_enabled:
+            print("  Crack-seg: disabled (YOLO_CRACK_ENABLED=False)")
+        else:
+            print(f"  Crack-seg: model not found at {_crack_model_path}")
 
     print("Connecting cameras...")
     camera_manager = CameraManager(config.CAMERA_FEEDS)
