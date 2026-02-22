@@ -25,7 +25,7 @@ interface Detection {
   class: string;
   confidence: number;
   bbox: [number, number, number, number]; // x1,y1,x2,y2 in pixels
-  depth_m?: number; // optional, show on box when present
+  distance_meters?: number | null;
 }
 
 type GraphNode = { node_id: string; pose: [number, number, number] | null; detections?: Array<{ class_name: string; confidence: number; category?: string }> };
@@ -85,7 +85,7 @@ export function ManualPage() {
   const [feedTick, setFeedTick] = useState(0);
   useEffect(() => {
     if (!USE_BACKEND_FEED || backendReachable !== true) return;
-    const t = setInterval(() => setFeedTick((n) => n + 1), 250);
+    const t = setInterval(() => setFeedTick((n) => n + 1), 100);
     return () => clearInterval(t);
   }, [backendReachable]);
 
@@ -133,9 +133,8 @@ export function ManualPage() {
       const bw = (x2 - x1) * scaleX;
       const bh = (y2 - y1) * scaleY;
 
-      const conf = Math.round(det.confidence * 100);
-      const depthStr = det.depth_m != null ? ` ${det.depth_m.toFixed(1)}m` : "";
-      const label = `${det.class} ${conf}%${depthStr}`;
+      const distStr = det.distance_meters != null ? ` · ${Math.round(det.distance_meters * 100)}cm` : "";
+      const label = `${det.class}${distStr}`;
 
       // Box
       ctx.strokeStyle = "#FF3000";

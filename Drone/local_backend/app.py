@@ -281,16 +281,22 @@ class ModelManager:
         self.llama_vision, self.llama_processor = load(self._vlm_model_id)
         print("✅ Vision model loaded (Qwen2.5-VL-3B 4-bit)")
     
+    _yolo_load_failed: bool = False  # class-level so we only print once when import fails
+
     def load_yolo(self):
-        """Load YOLO model."""
+        """Load YOLO model (once). If ultralytics missing, skip and don't spam log."""
         if self.yolo is not None:
             return
-        
-        print("Loading YOLO model...")
-        from ultralytics import YOLO
-        
-        self.yolo = YOLO("yolov8n.pt")
-        print("YOLO loaded")
+        if getattr(ModelManager, "_yolo_load_failed", False):
+            return
+        try:
+            print("Loading YOLO model...")
+            from ultralytics import YOLO
+            self.yolo = YOLO("yolov8n.pt")
+            print("YOLO loaded")
+        except Exception as e:
+            ModelManager._yolo_load_failed = True
+            print(f"YOLO not available ({e}). Install: python -m pip install ultralytics")
     
     def infer_llama(self, image: Image.Image, prompt: str) -> str:
         """Run vision inference via mlx-vlm (~1-3s on Apple Silicon)."""
@@ -335,7 +341,8 @@ class ModelManager:
     def detect_objects(self, image: Image.Image) -> List[Dict]:
         """Run YOLO object detection (conf=0.2 to get more detections)."""
         self.load_yolo()
-        # conf=0.2 so person/objects are detected more readily
+        if self.yolo is None:
+            return []
         results = self.yolo(image, conf=0.2, verbose=False)
         detections = []
         for r in results:
@@ -402,9 +409,13 @@ phantom_state = {
     "advisory": {"text": "", "mission": "search_rescue", "timestamp": ""},
     "npu_provider": "CPUExecutionProvider",
     "yolo_latency_ms": 0.0,
+    "depth_enabled": False,      # True once depth_anything model loaded
+    "depth_latency_ms": 0.0,     # per-frame depth inference time
+    "depth_provider": "not loaded",
     "current_mission": "search_rescue",
     "last_llm_time": 0.0,
     "yolo_error": None,  # set if Drone YOLO load or run fails
+    "yolo_enabled": False,  # OFF by default — frontend START AI enables it
     "agent_response": {"answer": "", "node_ids": [], "ts": 0.0},  # tactical query (voice/text) for Agent tab
 }
 
@@ -450,6 +461,9 @@ _simple_capture = None
 _simple_camera_frame = None  # BGR numpy array, updated by background task
 _simple_camera_jpeg = None   # bytes for /api/feed/.../processed
 _placeholder_jpeg = None     # "Camera starting..." placeholder to avoid 503 flicker
+
+# Depth Anything V2 estimator (loaded at startup if model file exists)
+_depth_estimator = None
 
 
 def _make_placeholder_frame(cv2_module):
@@ -512,6 +526,27 @@ def _eager_load_drone_yolo() -> None:
         print("  Install with: pip install ultralytics  (yolov8n.pt will download on first run)")
 
 
+def _eager_load_depth() -> None:
+    """Load Depth Anything V2 via HuggingFace transformers (auto-downloads model)."""
+    global _depth_estimator
+    try:
+        from depth_estimator import DepthEstimator
+    except ImportError:
+        try:
+            sys.path.insert(0, str(_HERE))
+            from depth_estimator import DepthEstimator
+        except ImportError:
+            print("  Depth: depth_estimator.py not found — skipping")
+            return
+
+    _depth_estimator = DepthEstimator()
+    if _depth_estimator.loaded:
+        phantom_state["depth_enabled"] = True
+        phantom_state["depth_provider"] = _depth_estimator.provider
+    else:
+        print("  Depth: failed to load — check that transformers and torch are installed")
+
+
 def _run_drone_yolo_on_frame(bgr_frame) -> List[Dict]:
     """Run Drone's models.detect_objects on a BGR frame. Returns list of {class, confidence, bbox, center}."""
     if bgr_frame is None:
@@ -546,9 +581,11 @@ async def _simple_camera_loop():
         return
     if _simple_capture is None or not _simple_capture.isOpened():
         return
+    loop = asyncio.get_event_loop()
     while True:
         try:
-            ret, frame = _simple_capture.read()
+            # Run blocking cap.read() in a thread so it doesn't stall the event loop
+            ret, frame = await loop.run_in_executor(None, _simple_capture.read)
             if ret and frame is not None:
                 frame = cv2.resize(frame, (640, 480))
                 _simple_camera_frame = frame
@@ -588,24 +625,41 @@ async def phantom_background_loop():
                     else:
                         # Fallback: Drone's YOLO (CPU) when Drone2 ONNX not loaded
                         detections = _run_drone_yolo_on_frame(frame)
+                    # Clear error when we successfully get detections (e.g. ONNX working)
+                    phantom_state["yolo_error"] = None
                     h, w = frame.shape[:2]
+                    # Depth Anything (Qualcomm AI Hub or HuggingFace) — attach distance_meters for minimap
+                    if _depth_estimator is not None and _depth_estimator.loaded:
+                        try:
+                            t_d = time.time()
+                            depth_map = _depth_estimator.infer(frame)
+                            phantom_state["depth_latency_ms"] = (time.time() - t_d) * 1000
+                            if depth_map is not None:
+                                for d in detections:
+                                    d["distance_meters"] = _depth_estimator.depth_at_bbox(
+                                        depth_map, d.get("bbox", [0, 0, 1, 1]), w, h
+                                    )
+                        except Exception:
+                            pass
                     mapped = p["detection_mapper"].map_detections(drone_id, detections, w, h)
                     phantom_state["detections"][drone_id] = mapped
                     if drone_id == "Drone-1":
                         phantom_state["raw_detections"] = list(detections)
                     vis = frame.copy()
-                    for d in detections:
-                        bbox = d.get("bbox", [0, 0, 0, 0])
-                        x1, y1, x2, y2 = [int(round(x)) for x in bbox]
-                        cls = d.get("class", "?")
-                        conf = d.get("confidence", 0)
-                        p["cv2"].rectangle(vis, (x1, y1), (x2, y2), (0, 255, 102), 2)
-                        label = f"{cls} {conf:.0%}"
-                        p["cv2"].putText(vis, label, (x1, y1 - 6), p["cv2"].FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 102), 1)
                     _, jpeg = p["cv2"].imencode(".jpg", vis)
                     phantom_state["processed_frames"][drone_id] = jpeg.tobytes()
-                except Exception:
+                except Exception as e:
                     phantom_state["detections"][drone_id] = []
+                    if phantom_state.get("_last_phantom_log_time", 0) < time.time() - 10:
+                        print(f"  Phantom YOLO frame: {e}")
+                        phantom_state["_last_phantom_log_time"] = time.time()
+                    # Still write a frame (no boxes) so the feed never goes blank
+                    try:
+                        vis = frame.copy()
+                        _, jpeg = p["cv2"].imencode(".jpg", vis)
+                        phantom_state["processed_frames"][drone_id] = jpeg.tobytes()
+                    except Exception:
+                        pass
             now = time.time()
             if now - phantom_state["last_llm_time"] >= getattr(p["config"], "LLM_UPDATE_INTERVAL", 12):
                 phantom_state["last_llm_time"] = now
@@ -626,39 +680,95 @@ async def phantom_background_loop():
         await asyncio.sleep(0.05)
 
 
+def _blocking_yolo(frame):
+    """Run YOLO inference only (called in thread executor)."""
+    try:
+        detections = _run_drone_yolo_on_frame(frame)
+        return detections, None
+    except Exception as e:
+        return [], str(e)
+
+
+def _blocking_depth(frame):
+    """Run depth inference only (called in thread executor)."""
+    if _depth_estimator is None or not _depth_estimator.loaded:
+        return None, 0.0
+    try:
+        t_d = time.time()
+        depth_map = _depth_estimator.infer(frame)
+        return depth_map, (time.time() - t_d) * 1000
+    except Exception:
+        return None, 0.0
+
+
+# Cached detections from the last completed inference — drawn on every live frame
+_cached_detections: list = []
+_inference_running = False
+
+
+async def _inference_background_loop():
+    """Run YOLO and depth in parallel threads; updates cached detections when both finish."""
+    global _cached_detections, _inference_running
+    import asyncio as _asyncio
+    loop = _asyncio.get_event_loop()
+    while True:
+        try:
+            if not phantom_state.get("yolo_enabled", False) or _simple_camera_frame is None:
+                _cached_detections = []
+                await _asyncio.sleep(0.1)
+                continue
+            frame = _simple_camera_frame.copy()
+            _inference_running = True
+            # Run YOLO (CPU) and Depth (HTP/NPU) concurrently in separate threads
+            (detections, yolo_error), (depth_map, depth_latency) = await _asyncio.gather(
+                loop.run_in_executor(None, _blocking_yolo, frame),
+                loop.run_in_executor(None, _blocking_depth, frame),
+            )
+            _inference_running = False
+            h, w = frame.shape[:2]
+            if depth_map is not None:
+                for d in detections:
+                    d["distance_meters"] = _depth_estimator.depth_at_bbox(
+                        depth_map, d.get("bbox", [0, 0, 1, 1]), w, h
+                    )
+            _cached_detections = detections
+            phantom_state["yolo_error"] = yolo_error
+            phantom_state["depth_latency_ms"] = depth_latency
+            phantom_state["raw_detections"] = list(detections)
+            phantom_state["detections"]["Drone-1"] = _map_detections_to_zone(detections, TACTICAL_ZONE_DRONE1, w, h)
+            phantom_state["detections"]["Drone-2"] = _map_detections_to_zone(detections, TACTICAL_ZONE_DRONE2, w, h)
+        except Exception as e:
+            _inference_running = False
+            if phantom_state.get("_last_yolo_log_time", 0) < time.time() - 10:
+                print(f"  Inference loop: {e}")
+                phantom_state["_last_yolo_log_time"] = time.time()
+        # No sleep — start next inference immediately after the last finishes
+
+
 async def _simple_yolo_loop():
-    """When Drone2 is not loaded: run Drone YOLO on laptop feed and fill phantom_state for UI + map."""
+    """20fps frame loop: overlays cached detections on the live camera frame."""
     import cv2
     while True:
         try:
             if _simple_camera_frame is None:
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.05)
                 continue
             frame = _simple_camera_frame.copy()
-            h, w = frame.shape[:2]
-            detections = _run_drone_yolo_on_frame(frame)
-            phantom_state["raw_detections"] = list(detections)
-            phantom_state["npu_provider"] = "CPUExecutionProvider"
-            phantom_state["yolo_latency_ms"] = 0.0
-            # Populate /api/detections for Drone2-style tactical map (map_x, map_y)
-            mapped1 = _map_detections_to_zone(detections, TACTICAL_ZONE_DRONE1, w, h)
-            mapped2 = _map_detections_to_zone(detections, TACTICAL_ZONE_DRONE2, w, h)
-            phantom_state["detections"]["Drone-1"] = mapped1
-            phantom_state["detections"]["Drone-2"] = mapped2
+
+            if not phantom_state.get("yolo_enabled", False):
+                phantom_state["raw_detections"] = []
+                phantom_state["detections"]["Drone-1"] = []
+                phantom_state["detections"]["Drone-2"] = []
             vis = frame.copy()
-            for d in detections:
-                bbox = d.get("bbox", [0, 0, 0, 0])
-                x1, y1, x2, y2 = [int(round(x)) for x in bbox]
-                cls = d.get("class", "?")
-                conf = d.get("confidence", 0)
-                cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 102), 2)
-                cv2.putText(vis, f"{cls} {conf:.0%}", (x1, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 102), 1)
+
             _, jpeg = cv2.imencode(".jpg", vis)
             phantom_state["processed_frames"]["Drone-1"] = jpeg.tobytes()
             phantom_state["processed_frames"]["Drone-2"] = jpeg.tobytes()
-        except Exception:
-            pass
-        await asyncio.sleep(0.2)
+        except Exception as e:
+            if phantom_state.get("_last_yolo_log_time", 0) < time.time() - 10:
+                print(f"  YOLO loop: {e}")
+                phantom_state["_last_yolo_log_time"] = time.time()
+        await asyncio.sleep(0.05)
 
 
 # Synthetic position for world graph when no real GPS (laptop webcam)
@@ -758,7 +868,7 @@ async def startup_event():
             phantom_yolo_detector = p["YOLODetector"](
                 str(_phantom_model_path),
                 qnn_dll_path=getattr(p["config"], "QNN_DLL_PATH", None),
-                confidence_threshold=getattr(p["config"], "YOLO_CONFIDENCE_THRESHOLD", 0.45),
+                confidence_threshold=0.25,  # lower so more objects show in frontend (was 0.45)
             )
             phantom_state["npu_provider"] = phantom_yolo_detector.get_provider()
             phantom_state["yolo_error"] = None
@@ -774,7 +884,11 @@ async def startup_event():
     elif _simple_capture is not None and _simple_capture.isOpened():
         _eager_load_drone_yolo()
         asyncio.create_task(_simple_yolo_loop())
+        asyncio.create_task(_inference_background_loop())
         print("  YOLO: Drone CPU (on laptop feed)")
+
+    # 2b) Depth Anything V2 — load alongside YOLO for real distance estimation
+    _eager_load_depth()
 
     # 3) World graph for tactical map: ingest laptop feed so map has nodes
     if _world_graph is not None and _simple_capture is not None and _simple_capture.isOpened():
@@ -1071,7 +1185,52 @@ def api_status():
         "camera_ready": camera_ready,
         "yolo_loaded": yolo_loaded,
         "yolo_error": yolo_error,
+        "depth_enabled": phantom_state.get("depth_enabled", False),
+        "depth_latency_ms": round(phantom_state.get("depth_latency_ms", 0), 1),
+        "depth_provider": phantom_state.get("depth_provider", "not loaded"),
     }
+
+
+@app.post("/api/yolo/start")
+def api_yolo_start():
+    phantom_state["yolo_enabled"] = True
+    return {"yolo_enabled": True}
+
+
+@app.post("/api/yolo/stop")
+def api_yolo_stop():
+    phantom_state["yolo_enabled"] = False
+    phantom_state["raw_detections"] = []
+    phantom_state["detections"] = {}
+    return {"yolo_enabled": False}
+
+
+@app.post("/api/yolo/frame")
+async def api_yolo_frame(request: Request):
+    """Run YOLO on a single JPEG frame (raw bytes in request body). Returns detections."""
+    body = await request.body()
+    if not body:
+        return JSONResponse({"detections": []})
+    try:
+        import cv2 as _cv2
+        import numpy as _np
+        nparr = _np.frombuffer(body, _np.uint8)
+        frame = _cv2.imdecode(nparr, _cv2.IMREAD_COLOR)
+        if frame is None:
+            return JSONResponse({"detections": []})
+        detections = _run_drone_yolo_on_frame(frame)
+        # Run depth alongside YOLO for stream mode
+        if _depth_estimator is not None and _depth_estimator.loaded and detections:
+            h, w = frame.shape[:2]
+            depth_map = _depth_estimator.infer(frame)
+            if depth_map is not None:
+                for d in detections:
+                    d["distance_meters"] = _depth_estimator.depth_at_bbox(
+                        depth_map, d.get("bbox", [0, 0, 1, 1]), w, h
+                    )
+        return JSONResponse({"detections": detections})
+    except Exception as e:
+        return JSONResponse({"detections": [], "error": str(e)})
 
 
 @app.get("/api/detections")
@@ -1114,10 +1273,17 @@ def api_feed_processed(drone_id: str):
     # Prefer YOLO-overlay frame (from phantom_background_loop or _simple_yolo_loop)
     jpeg = phantom_state.get("processed_frames", {}).get(drone_id)
     if jpeg:
-        return Response(content=jpeg, media_type="image/jpeg")
+        return Response(
+            content=jpeg,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"},
+        )
     if _simple_camera_jpeg is not None:
-        return Response(content=_simple_camera_jpeg, media_type="image/jpeg")
-    # Avoid 503 flicker: serve placeholder until first frame is ready
+        return Response(
+            content=_simple_camera_jpeg,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "no-store"},
+        )
     if _placeholder_jpeg is not None:
         return Response(content=_placeholder_jpeg, media_type="image/jpeg")
     raise HTTPException(status_code=503, detail="Camera not available")
@@ -1425,13 +1591,13 @@ async def live_detections(run_llama: bool = False):
             yield f"data: {json.dumps({'type': 'waiting', 'message': 'Starting camera feed...'})}\n\n"
         except Exception as e:
             yield f"data: {json.dumps({'type': 'waiting', 'message': str(e)})}\n\n"
-        # Use laptop state whenever feeds are active (from _simple_yolo_loop or phantom_background_loop)
-        has_laptop_feed = bool(
-            phantom_state.get("feeds", {}).get("Drone-1")
-            or phantom_state.get("feeds", {}).get("Drone-2")
-            or (_simple_capture is not None and _simple_capture.isOpened())
-        )
         while True:
+            # Re-check on every iteration so we pick up the camera after it finishes starting
+            has_laptop_feed = bool(
+                phantom_state.get("feeds", {}).get("Drone-1")
+                or phantom_state.get("feeds", {}).get("Drone-2")
+                or (_simple_capture is not None and _simple_capture.isOpened())
+            )
             try:
                 # 1) Try iPhone stream first
                 try:
@@ -1461,7 +1627,7 @@ async def live_detections(run_llama: bool = False):
                                         "llama_description": llama_description,
                                     }
                                     yield f"data: {json.dumps(event)}\n\n"
-                                    await asyncio.sleep(0.2 if not run_llama else 2.0)
+                                    await asyncio.sleep(0.05 if not run_llama else 2.0)
                                     continue
                 except Exception:
                     pass
@@ -1469,6 +1635,9 @@ async def live_detections(run_llama: bool = False):
                 # 2) Laptop camera: use phantom_state (filled by YOLO loop)
                 if has_laptop_feed:
                     raw = phantom_state.get("raw_detections", [])
+                    # Fallback: use mapped detections for Drone-1 if raw not populated (same keys + map_x, map_y)
+                    if not raw:
+                        raw = phantom_state.get("detections", {}).get("Drone-1", [])
                     detections = [
                         {"class": d.get("class", "?"), "confidence": float(d.get("confidence", 0)), "bbox": list(d.get("bbox", [0, 0, 0, 0]))}
                         for d in raw
@@ -1476,7 +1645,7 @@ async def live_detections(run_llama: bool = False):
                     advisory = phantom_state.get("advisory", {})
                     llama_description = advisory.get("text", "") if run_llama else None
                     yield f"data: {json.dumps({'type': 'detections', 'timestamp': time.time(), 'detections': detections, 'detection_count': len(detections), 'llama_description': llama_description})}\n\n"
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(0.05)
                     continue
 
                 # 3) Simple laptop webcam fallback (no Drone2)
@@ -1497,7 +1666,7 @@ async def live_detections(run_llama: bool = False):
                         yield f"data: {json.dumps({'type': 'detections', 'timestamp': time.time(), 'detections': detections, 'detection_count': len(detections), 'llama_description': llama_description})}\n\n"
                     except Exception:
                         pass
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(0.05)
                     continue
 
                 yield f"data: {json.dumps({'type': 'waiting', 'message': 'No camera feed yet'})}\n\n"

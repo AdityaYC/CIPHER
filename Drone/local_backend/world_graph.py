@@ -167,8 +167,8 @@ class WorldGraph:
             # Categorize object
             category = self.category_map.get(class_name, ObjectCategory.UNKNOWN)
             
-            # Estimate distance (placeholder - would use depth estimation)
-            distance = self._estimate_distance(bbox, alt)
+            # Use real depth from Depth Anything V2 if available, else bbox heuristic
+            distance = det.get("distance_meters") or self._estimate_distance(bbox, alt)
             
             detection = Detection(
                 class_name=class_name,

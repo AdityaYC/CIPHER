@@ -1,0 +1,9 @@
+# Core backend deps (no torch/ultralytics — use with ONNX YOLO to avoid Windows long-path issue)
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.12
+pillow>=11.0.0
+numpy>=2.1.0
+opencv-python>=4.8.0
+onnxruntime>=1.14.0
+pydantic-settings>=2.0.0
