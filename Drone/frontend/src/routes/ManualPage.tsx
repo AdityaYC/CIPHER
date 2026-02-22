@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, useCallback, useRef } from "react";
+import { useEffect, useLayoutEffect, useMemo, useState, useCallback, useRef } from "react";
 import { IPHONE_STREAM_URL, API_BASE_URL, BACKEND_FEED_BASE } from "../config";
 import { fetchTacticalStatus, fetchTacticalDetections, type TacticalStatus, type TacticalDetections } from "../api/tactical";
 
@@ -110,8 +110,8 @@ export function ManualPage() {
     return () => clearInterval(t);
   }, [backendReachable]);
 
-  // Draw YOLO boxes on canvas overlay
-  useEffect(() => {
+  // Draw YOLO boxes on canvas overlay (useLayoutEffect runs before paint — no flicker gap)
+  useLayoutEffect(() => {
     const img = imgRef.current;
     const canvas = canvasRef.current;
     if (!canvas || !img) return;
@@ -153,7 +153,7 @@ export function ManualPage() {
       ctx.fillStyle = "#fff";
       ctx.fillText(label, bx + 4, by - 5);
     });
-  }, [detections]);
+  }, [detections, feedTick]);
 
   // SSE connection to /live_detections
   const startDetections = useCallback(() => {
@@ -304,14 +304,6 @@ export function ManualPage() {
               }
               alt="Camera Feed"
               style={{ background: "#000", width: "100%", height: "100%", objectFit: "contain" }}
-              onLoad={() => {
-                const canvas = canvasRef.current;
-                const img = imgRef.current;
-                if (canvas && img) {
-                  canvas.width = img.clientWidth;
-                  canvas.height = img.clientHeight;
-                }
-              }}
               onError={() => {}}
             />
             {/* X Y Z YAW top-left */}
