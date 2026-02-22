@@ -59,9 +59,32 @@ YOLO_CONFIDENCE_THRESHOLD = 0.45
 YOLO_INPUT_SIZE = 640  # YOLOv8 expects 640x640
 
 # --- NPU ---
-# Update this path after checking the laptop. Run: dir C:\Qualcomm
-# Browse to: C:\Qualcomm\AIStack\QAIRT\<version>\lib\arm64x-windows-msvc\
-QNN_DLL_PATH = r"C:\Users\hackathon user\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\onnxruntime\capi\QnnHtp.dll"
+# Auto-detect QnnHtp.dll from onnxruntime installation (works on any machine).
+# Falls back to Qualcomm QAIRT SDK paths if onnxruntime doesn't bundle it.
+def _find_qnn_dll() -> str | None:
+    """Locate QnnHtp.dll: check onnxruntime install, then Qualcomm SDK paths."""
+    from pathlib import Path as _P
+    # 1) onnxruntime bundled QNN (most reliable)
+    try:
+        import onnxruntime as _ort
+        candidate = _P(_ort.__file__).parent / "capi" / "QnnHtp.dll"
+        if candidate.exists():
+            return str(candidate)
+    except ImportError:
+        pass
+    # 2) Qualcomm AI Stack / QAIRT SDK
+    for sdk_root in [_P(r"C:\Qualcomm\AIStack\QAIRT"), _P.home() / "Qualcomm" / "AIStack" / "QAIRT"]:
+        if sdk_root.is_dir():
+            for dll in sorted(sdk_root.rglob("QnnHtp.dll"), reverse=True):
+                return str(dll)
+    # 3) Environment variable override
+    import os as _os2
+    env = _os2.environ.get("QNN_DLL_PATH", "").strip()
+    if env and _P(env).exists():
+        return env
+    return None
+
+QNN_DLL_PATH = _find_qnn_dll()
 
 # --- LLM ---
 LLM_MODEL = "phi3:mini"

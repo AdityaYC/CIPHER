@@ -862,31 +862,60 @@ async def startup_event():
     except Exception as e:
         print(f"  Camera: {e}")
 
-    # 2) YOLO: Drone2 ONNX if available, else Drone CPU YOLO on laptop feed
-    if _phantom and _phantom_model_path.exists():
+    # 2) YOLO: try NPU-optimized loader first, then Drone2 ONNX, then CPU fallback
+    _yolo_loaded = False
+
+    # 2a) YOLONPUInference: tries Qualcomm AI Hub → ONNX+QNN → ONNX CPU → Ultralytics
+    if not _yolo_loaded:
+        try:
+            from yolo_npu import YOLONPUInference
+            npu_yolo = YOLONPUInference(
+                use_npu=True,
+                onnx_path=str(_phantom_model_path) if _phantom_model_path.exists() else None,
+            )
+            phantom_yolo_detector = npu_yolo
+            phantom_state["npu_provider"] = npu_yolo.get_provider()
+            phantom_state["yolo_error"] = None
+            _yolo_loaded = True
+            info = npu_yolo.get_backend_info()
+            print(f"  YOLO: {info['device']} (backend={info['backend']})")
+        except Exception as e:
+            print(f"  YOLO NPU: failed ({e})")
+
+    # 2b) Fallback: Drone2 ONNX perception.py (uses config.QNN_DLL_PATH)
+    if not _yolo_loaded and _phantom and _phantom_model_path.exists():
         try:
             p = _phantom
             phantom_yolo_detector = p["YOLODetector"](
                 str(_phantom_model_path),
                 qnn_dll_path=getattr(p["config"], "QNN_DLL_PATH", None),
-                confidence_threshold=0.25,  # lower so more objects show in frontend (was 0.45)
+                confidence_threshold=0.25,
             )
             phantom_state["npu_provider"] = phantom_yolo_detector.get_provider()
             phantom_state["yolo_error"] = None
-            asyncio.create_task(phantom_background_loop())
-            print("  Drone2 YOLO: loaded (on laptop feed)")
+            _yolo_loaded = True
+            print(f"  YOLO: Drone2 ONNX ({phantom_yolo_detector.get_provider()})")
         except Exception as e:
-            print(f"  Drone2 YOLO: not loaded ({e})")
+            print(f"  YOLO Drone2 ONNX: not loaded ({e})")
             phantom_yolo_detector = None
-            if _simple_capture is not None and _simple_capture.isOpened():
-                _eager_load_drone_yolo()
-                asyncio.create_task(phantom_background_loop())
-                print("  YOLO: using Drone CPU fallback (on laptop feed)")
-    elif _simple_capture is not None and _simple_capture.isOpened():
+
+    # 2c) Fallback: Ultralytics CPU YOLO
+    if not _yolo_loaded and _simple_capture is not None and _simple_capture.isOpened():
         _eager_load_drone_yolo()
+        _yolo_loaded = getattr(models, "yolo", None) is not None
+        if _yolo_loaded:
+            print("  YOLO: Ultralytics CPU fallback")
+
+    # Start the appropriate background loop
+    if _yolo_loaded and phantom_yolo_detector is not None:
+        if _phantom:
+            asyncio.create_task(phantom_background_loop())
+        elif _simple_capture is not None and _simple_capture.isOpened():
+            asyncio.create_task(_simple_yolo_loop())
+            asyncio.create_task(_inference_background_loop())
+    elif _yolo_loaded and _simple_capture is not None and _simple_capture.isOpened():
         asyncio.create_task(_simple_yolo_loop())
         asyncio.create_task(_inference_background_loop())
-        print("  YOLO: Drone CPU (on laptop feed)")
 
     # 2b) Depth Anything V2 — load alongside YOLO for real distance estimation
     _eager_load_depth()

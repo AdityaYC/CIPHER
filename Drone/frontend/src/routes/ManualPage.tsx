@@ -323,7 +323,9 @@ export function ManualPage() {
                 padding: "0.3rem 0.5rem", borderRadius: "4px",
                 fontSize: "0.7rem",
               }}>
-                {tacticalStatus.yolo_latency_ms != null ? `NPU ${Math.round(tacticalStatus.yolo_latency_ms)}ms` : "NPU —"}
+                {tacticalStatus.npu_provider?.includes("QNN") || tacticalStatus.npu_provider?.includes("Qualcomm")
+                  ? <><span style={{ color: "#00ff66" }}>NPU</span> {Math.round(tacticalStatus.yolo_latency_ms ?? 0)}ms</>
+                  : <><span style={{ color: "#ffaa00" }}>CPU</span> {tacticalStatus.yolo_latency_ms != null ? `${Math.round(tacticalStatus.yolo_latency_ms)}ms` : "—"}</>}
               </div>
             )}
             {/* LIVE bottom-left */}

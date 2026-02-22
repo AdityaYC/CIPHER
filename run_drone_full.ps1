@@ -45,10 +45,48 @@ if ($pythonExe -match "\\") {
     $env:Path = "$pyDir;$scriptsDir;$env:Path"
 }
 
+Write-Host "  Python: $pythonExe" -ForegroundColor Cyan
+
+# Pre-flight: check YOLO ONNX model
+$yoloModel = Join-Path $root "models\yolov8_det.onnx"
+if (-not (Test-Path $yoloModel)) {
+    Write-Host "  YOLO model missing — downloading..." -ForegroundColor Yellow
+    $dlScript = Join-Path $root "scripts\download_yolo_onnx.py"
+    if (Test-Path $dlScript) {
+        & $pythonExe $dlScript 2>&1 | Out-Null
+    } else {
+        Write-Host "    (download script not found, backend will fall back to Ultralytics)" -ForegroundColor DarkYellow
+    }
+}
+if (Test-Path $yoloModel) {
+    Write-Host "  YOLO ONNX: $yoloModel" -ForegroundColor Cyan
+} else {
+    Write-Host "  YOLO ONNX: not found (will use Ultralytics CPU fallback)" -ForegroundColor DarkYellow
+}
+
+# Pre-flight: detect NPU availability
+$npuInfo = & $pythonExe -c @"
+try:
+    import onnxruntime as ort
+    provs = ort.get_available_providers()
+    from pathlib import Path
+    qnn = Path(ort.__file__).parent / 'capi' / 'QnnHtp.dll'
+    if 'QNNExecutionProvider' in provs and qnn.exists():
+        print('QNN NPU (Hexagon) available')
+    else:
+        print('CPU only (providers: ' + ', '.join(provs) + ')')
+except ImportError:
+    print('onnxruntime not installed')
+except Exception as e:
+    print(f'check failed: {e}')
+"@ 2>&1
+Write-Host "  NPU: $npuInfo" -ForegroundColor Cyan
+
 # Drone backend (includes Drone2: laptop webcam, YOLO, advisory, /api/status, Agent tactical query, etc.)
 # PYTHONPATH must be repo root so "backend" (vector_db, query_agent) can be imported for Agent tab queries
 $env:PYTHONPATH = $root
 $env:PHANTOM_HTTP_ONLY = "1"
+Write-Host ""
 Write-Host "Drone backend (with Drone2 features) starting on http://localhost:8000 ..."
 Start-Process -FilePath $pythonExe -ArgumentList "-m", "uvicorn", "Drone.local_backend.app:app", "--host", "0.0.0.0", "--port", "8000" -WorkingDirectory $root
 

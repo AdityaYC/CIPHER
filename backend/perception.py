@@ -48,6 +48,15 @@ class YOLODetector:
                     break
 
         prov_list = []
+        # Auto-detect QNN DLL if the configured path doesn't exist
+        if qnn_dll_path and not Path(qnn_dll_path).exists():
+            try:
+                _auto = Path(ort.__file__).parent / "capi" / "QnnHtp.dll"
+                if _auto.exists():
+                    qnn_dll_path = str(_auto)
+                    logger.info(f"Auto-detected QnnHtp.dll at {qnn_dll_path}")
+            except Exception:
+                pass
         if qnn_dll_path and Path(qnn_dll_path).exists():
             prov_list.append(("QNNExecutionProvider", {"backend_path": qnn_dll_path}))
         prov_list.append("CPUExecutionProvider")
