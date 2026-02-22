@@ -27,7 +27,7 @@ METRIC_MAX_M = 50.0
 # Qualcomm ONNX fallback (relative model — still needs scale mapping)
 _HERE = Path(__file__).resolve().parent
 _REPO_ROOT = _HERE.parent.parent
-QUALCOMM_ONNX_PATH = _REPO_ROOT / "models" / "depth_anything_v2_vits.onnx"
+QUALCOMM_ONNX_PATH = _REPO_ROOT / "models" / "depth_anything_v2_indoor_small_onnx_mnl2019oq.onnx"
 ONNX_INPUT_SIZE = 518
 ONNX_DEPTH_MIN_M = 0.2
 ONNX_DEPTH_MAX_M = 20.0
@@ -118,7 +118,7 @@ class DepthEstimator:
         return None
 
     def _infer_onnx(self, bgr_frame: np.ndarray) -> Optional[np.ndarray]:
-        """Qualcomm ONNX relative depth → mapped to metres."""
+        """Qualcomm AI Hub ONNX — outputs metric depth in metres, clip to valid indoor range."""
         try:
             import cv2
             h_orig, w_orig = bgr_frame.shape[:2]
@@ -130,10 +130,8 @@ class DepthEstimator:
             depth = out.squeeze().astype(np.float32)
             if depth.shape[0] != h_orig or depth.shape[1] != w_orig:
                 depth = cv2.resize(depth, (w_orig, h_orig), interpolation=cv2.INTER_LINEAR)
-            # Normalise relative → 0-1, then map to metres
-            dmin, dmax = depth.min(), depth.max()
-            depth = (depth - dmin) / (dmax - dmin) if dmax > dmin else np.zeros_like(depth)
-            depth = ONNX_DEPTH_MIN_M + depth ** 0.85 * (ONNX_DEPTH_MAX_M - ONNX_DEPTH_MIN_M)
+            # Model outputs disparity (higher = closer) — empirical calibration: k=0.643
+            depth = np.clip(0.643 / np.maximum(depth, 0.01), ONNX_DEPTH_MIN_M, ONNX_DEPTH_MAX_M)
             return depth
         except Exception as e:
             logger.debug(f"Depth ONNX inference error: {e}")
