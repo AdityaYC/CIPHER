@@ -18,6 +18,9 @@ export type TacticalStatus = {
   camera_ready?: boolean;
   yolo_loaded?: boolean;
   yolo_error?: string | null;
+  depth_enabled?: boolean;
+  depth_latency_ms?: number;
+  depth_provider?: string;
 };
 
 export type MappedDetection = {
@@ -25,6 +28,7 @@ export type MappedDetection = {
   confidence: number;
   map_x: number;
   map_y: number;
+  distance_meters?: number | null;
 };
 
 export type TacticalDetections = Record<string, MappedDetection[]>;

@@ -87,11 +87,17 @@ class YOLODetector:
         out = self._session.run(None, {self._input_name: inp})
         self._last_latency_ms = (time.perf_counter() - start) * 1000
 
-        # YOLOv8 output: (1, 84, 8400) -> 8400 boxes, 84 = 4 + 80
+        # YOLOv8 ONNX output: (1, 84, 8400) or (1, 8400, 84) depending on export
         raw = out[0]
         if raw.ndim == 3:
-            raw = raw[0]  # (84, 8400)
-        raw = np.transpose(raw, (1, 0))  # (8400, 84)
+            raw = raw[0]
+        # Ensure shape (8400, 84): 8400 boxes, 84 = 4 (cx,cy,w,h) + 80 classes
+        if raw.shape[0] == 84 and raw.shape[1] == 8400:
+            raw = np.transpose(raw, (1, 0))  # -> (8400, 84)
+        elif raw.shape[0] == 8400 and raw.shape[1] == 84:
+            pass  # already (8400, 84)
+        else:
+            raw = np.transpose(raw, (1, 0))  # try transpose for other layouts
         scale_x = w_orig / self._input_size
         scale_y = h_orig / self._input_size
 

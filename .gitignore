@@ -16,4 +16,10 @@ ssl/*.pem
 # Models (download with scripts/download_model.py)
 models/*.onnx
 models/*.pt
+models/*.zip
+models/*.data
+models/job_*/
 !models/.gitkeep
+
+# Root-level model weights
+*.pt
