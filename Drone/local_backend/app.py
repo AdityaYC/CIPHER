@@ -24,9 +24,10 @@ from pathlib import Path
 from typing import Dict, List, Optional
 from io import BytesIO
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from PIL import Image
 
@@ -35,6 +36,9 @@ _HERE = Path(__file__).resolve().parent
 _DRONE2_ROOT = _HERE.parent.parent
 if str(_DRONE2_ROOT) not in sys.path:
     sys.path.insert(0, str(_DRONE2_ROOT))
+# So "from world_graph import WorldGraph" works when cwd is repo root (e.g. run_drone_full.ps1)
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
 
 # Optional Drone2 backend (camera, YOLO ONNX, advisory)
 _phantom = None
@@ -76,6 +80,7 @@ app.add_middleware(
 _PROJECT = _HERE.parent
 _DATA = _PROJECT / "data"
 _DRONE_FRONTEND_DIST = _PROJECT / "frontend" / "dist"
+_EXPORTS_DIR = _DRONE2_ROOT / "exports"
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -276,16 +281,22 @@ class ModelManager:
         self.llama_vision, self.llama_processor = load(self._vlm_model_id)
         print("✅ Vision model loaded (Qwen2.5-VL-3B 4-bit)")
     
+    _yolo_load_failed: bool = False  # class-level so we only print once when import fails
+
     def load_yolo(self):
-        """Load YOLO model."""
+        """Load YOLO model (once). If ultralytics missing, skip and don't spam log."""
         if self.yolo is not None:
             return
-        
-        print("Loading YOLO model...")
-        from ultralytics import YOLO
-        
-        self.yolo = YOLO("yolov8n.pt")
-        print("YOLO loaded")
+        if getattr(ModelManager, "_yolo_load_failed", False):
+            return
+        try:
+            print("Loading YOLO model...")
+            from ultralytics import YOLO
+            self.yolo = YOLO("yolov8n.pt")
+            print("YOLO loaded")
+        except Exception as e:
+            ModelManager._yolo_load_failed = True
+            print(f"YOLO not available ({e}). Install: python -m pip install ultralytics")
     
     def infer_llama(self, image: Image.Image, prompt: str) -> str:
         """Run vision inference via mlx-vlm (~1-3s on Apple Silicon)."""
@@ -330,7 +341,8 @@ class ModelManager:
     def detect_objects(self, image: Image.Image) -> List[Dict]:
         """Run YOLO object detection (conf=0.2 to get more detections)."""
         self.load_yolo()
-        # conf=0.2 so person/objects are detected more readily
+        if self.yolo is None:
+            return []
         results = self.yolo(image, conf=0.2, verbose=False)
         detections = []
         for r in results:
@@ -361,11 +373,30 @@ class AgentRequest(BaseModel):
 # World graph for tactical map (same as Drone2 graph_api)
 # ---------------------------------------------------------------------------
 _world_graph = None
-try:
-    from world_graph import WorldGraph
-    _world_graph = WorldGraph()
-except Exception:
-    pass
+
+
+def _get_world_graph():
+    """Return world graph, creating it if needed so import/3D map always have one."""
+    global _world_graph
+    if _world_graph is not None:
+        return _world_graph
+    try:
+        from world_graph import WorldGraph
+        _world_graph = WorldGraph()
+        return _world_graph
+    except Exception:
+        try:
+            from .world_graph import WorldGraph
+            _world_graph = WorldGraph()
+            return _world_graph
+        except Exception as e:
+            print(f"World graph not loaded: {e}")
+            return None
+    return None
+
+
+# Ensure world graph exists at load (so ingest loop etc. can use it)
+_world_graph = _get_world_graph()
 
 # ---------------------------------------------------------------------------
 # Drone2 tactical state (laptop camera, YOLO, advisory)
@@ -378,11 +409,49 @@ phantom_state = {
     "advisory": {"text": "", "mission": "search_rescue", "timestamp": ""},
     "npu_provider": "CPUExecutionProvider",
     "yolo_latency_ms": 0.0,
+    "depth_enabled": False,      # True once depth_anything model loaded
+    "depth_latency_ms": 0.0,     # per-frame depth inference time
+    "depth_provider": "not loaded",
     "current_mission": "search_rescue",
     "last_llm_time": 0.0,
     "yolo_error": None,  # set if Drone YOLO load or run fails
+    "yolo_enabled": False,  # OFF by default — frontend START AI enables it
     "agent_response": {"answer": "", "node_ids": [], "ts": 0.0},  # tactical query (voice/text) for Agent tab
 }
+
+# Combined agent (spatial + knowledge): 3D Map AGENT mode
+agent_state = {
+    "ready": False,
+    "initializing": True,
+    "last_result": None,  # OrchestratorResult for UI highlight/path
+    "running": False,
+}
+
+
+async def _agent_init_background():
+    """Pre-load CLIP, Chroma + manuals, Genie check. Sets agent_state.ready."""
+    global agent_state
+    try:
+        from clip_navigator import load_clip
+        load_clip()
+    except Exception as e:
+        print(f"  Agent (CLIP): skip ({e})")
+    try:
+        from knowledge_agent import load_vector_db
+        wg = _get_world_graph()
+        load_vector_db(wg)
+    except Exception as e:
+        print(f"  Agent (vector DB): skip ({e})")
+    try:
+        from backend.genie_runner import is_available
+        if is_available():
+            print("  Agent (Genie): ready")
+    except Exception:
+        pass
+    agent_state["initializing"] = False
+    agent_state["ready"] = True
+
+
 phantom_camera_manager = None
 phantom_yolo_detector = None
 _phantom_model_path = _DRONE2_ROOT / "models" / "yolov8_det.onnx"
@@ -392,6 +461,9 @@ _simple_capture = None
 _simple_camera_frame = None  # BGR numpy array, updated by background task
 _simple_camera_jpeg = None   # bytes for /api/feed/.../processed
 _placeholder_jpeg = None     # "Camera starting..." placeholder to avoid 503 flicker
+
+# Depth Anything V2 estimator (loaded at startup if model file exists)
+_depth_estimator = None
 
 
 def _make_placeholder_frame(cv2_module):
@@ -454,6 +526,27 @@ def _eager_load_drone_yolo() -> None:
         print("  Install with: pip install ultralytics  (yolov8n.pt will download on first run)")
 
 
+def _eager_load_depth() -> None:
+    """Load Depth Anything V2 via HuggingFace transformers (auto-downloads model)."""
+    global _depth_estimator
+    try:
+        from depth_estimator import DepthEstimator
+    except ImportError:
+        try:
+            sys.path.insert(0, str(_HERE))
+            from depth_estimator import DepthEstimator
+        except ImportError:
+            print("  Depth: depth_estimator.py not found — skipping")
+            return
+
+    _depth_estimator = DepthEstimator()
+    if _depth_estimator.loaded:
+        phantom_state["depth_enabled"] = True
+        phantom_state["depth_provider"] = _depth_estimator.provider
+    else:
+        print("  Depth: failed to load — check that transformers and torch are installed")
+
+
 def _run_drone_yolo_on_frame(bgr_frame) -> List[Dict]:
     """Run Drone's models.detect_objects on a BGR frame. Returns list of {class, confidence, bbox, center}."""
     if bgr_frame is None:
@@ -488,9 +581,11 @@ async def _simple_camera_loop():
         return
     if _simple_capture is None or not _simple_capture.isOpened():
         return
+    loop = asyncio.get_event_loop()
     while True:
         try:
-            ret, frame = _simple_capture.read()
+            # Run blocking cap.read() in a thread so it doesn't stall the event loop
+            ret, frame = await loop.run_in_executor(None, _simple_capture.read)
             if ret and frame is not None:
                 frame = cv2.resize(frame, (640, 480))
                 _simple_camera_frame = frame
@@ -530,24 +625,41 @@ async def phantom_background_loop():
                     else:
                         # Fallback: Drone's YOLO (CPU) when Drone2 ONNX not loaded
                         detections = _run_drone_yolo_on_frame(frame)
+                    # Clear error when we successfully get detections (e.g. ONNX working)
+                    phantom_state["yolo_error"] = None
                     h, w = frame.shape[:2]
+                    # Depth Anything (Qualcomm AI Hub or HuggingFace) — attach distance_meters for minimap
+                    if _depth_estimator is not None and _depth_estimator.loaded:
+                        try:
+                            t_d = time.time()
+                            depth_map = _depth_estimator.infer(frame)
+                            phantom_state["depth_latency_ms"] = (time.time() - t_d) * 1000
+                            if depth_map is not None:
+                                for d in detections:
+                                    d["distance_meters"] = _depth_estimator.depth_at_bbox(
+                                        depth_map, d.get("bbox", [0, 0, 1, 1]), w, h
+                                    )
+                        except Exception:
+                            pass
                     mapped = p["detection_mapper"].map_detections(drone_id, detections, w, h)
                     phantom_state["detections"][drone_id] = mapped
                     if drone_id == "Drone-1":
                         phantom_state["raw_detections"] = list(detections)
                     vis = frame.copy()
-                    for d in detections:
-                        bbox = d.get("bbox", [0, 0, 0, 0])
-                        x1, y1, x2, y2 = [int(round(x)) for x in bbox]
-                        cls = d.get("class", "?")
-                        conf = d.get("confidence", 0)
-                        p["cv2"].rectangle(vis, (x1, y1), (x2, y2), (0, 255, 102), 2)
-                        label = f"{cls} {conf:.0%}"
-                        p["cv2"].putText(vis, label, (x1, y1 - 6), p["cv2"].FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 102), 1)
                     _, jpeg = p["cv2"].imencode(".jpg", vis)
                     phantom_state["processed_frames"][drone_id] = jpeg.tobytes()
-                except Exception:
+                except Exception as e:
                     phantom_state["detections"][drone_id] = []
+                    if phantom_state.get("_last_phantom_log_time", 0) < time.time() - 10:
+                        print(f"  Phantom YOLO frame: {e}")
+                        phantom_state["_last_phantom_log_time"] = time.time()
+                    # Still write a frame (no boxes) so the feed never goes blank
+                    try:
+                        vis = frame.copy()
+                        _, jpeg = p["cv2"].imencode(".jpg", vis)
+                        phantom_state["processed_frames"][drone_id] = jpeg.tobytes()
+                    except Exception:
+                        pass
             now = time.time()
             if now - phantom_state["last_llm_time"] >= getattr(p["config"], "LLM_UPDATE_INTERVAL", 12):
                 phantom_state["last_llm_time"] = now
@@ -568,39 +680,95 @@ async def phantom_background_loop():
         await asyncio.sleep(0.05)
 
 
+def _blocking_yolo(frame):
+    """Run YOLO inference only (called in thread executor)."""
+    try:
+        detections = _run_drone_yolo_on_frame(frame)
+        return detections, None
+    except Exception as e:
+        return [], str(e)
+
+
+def _blocking_depth(frame):
+    """Run depth inference only (called in thread executor)."""
+    if _depth_estimator is None or not _depth_estimator.loaded:
+        return None, 0.0
+    try:
+        t_d = time.time()
+        depth_map = _depth_estimator.infer(frame)
+        return depth_map, (time.time() - t_d) * 1000
+    except Exception:
+        return None, 0.0
+
+
+# Cached detections from the last completed inference — drawn on every live frame
+_cached_detections: list = []
+_inference_running = False
+
+
+async def _inference_background_loop():
+    """Run YOLO and depth in parallel threads; updates cached detections when both finish."""
+    global _cached_detections, _inference_running
+    import asyncio as _asyncio
+    loop = _asyncio.get_event_loop()
+    while True:
+        try:
+            if not phantom_state.get("yolo_enabled", False) or _simple_camera_frame is None:
+                _cached_detections = []
+                await _asyncio.sleep(0.1)
+                continue
+            frame = _simple_camera_frame.copy()
+            _inference_running = True
+            # Run YOLO (CPU) and Depth (HTP/NPU) concurrently in separate threads
+            (detections, yolo_error), (depth_map, depth_latency) = await _asyncio.gather(
+                loop.run_in_executor(None, _blocking_yolo, frame),
+                loop.run_in_executor(None, _blocking_depth, frame),
+            )
+            _inference_running = False
+            h, w = frame.shape[:2]
+            if depth_map is not None:
+                for d in detections:
+                    d["distance_meters"] = _depth_estimator.depth_at_bbox(
+                        depth_map, d.get("bbox", [0, 0, 1, 1]), w, h
+                    )
+            _cached_detections = detections
+            phantom_state["yolo_error"] = yolo_error
+            phantom_state["depth_latency_ms"] = depth_latency
+            phantom_state["raw_detections"] = list(detections)
+            phantom_state["detections"]["Drone-1"] = _map_detections_to_zone(detections, TACTICAL_ZONE_DRONE1, w, h)
+            phantom_state["detections"]["Drone-2"] = _map_detections_to_zone(detections, TACTICAL_ZONE_DRONE2, w, h)
+        except Exception as e:
+            _inference_running = False
+            if phantom_state.get("_last_yolo_log_time", 0) < time.time() - 10:
+                print(f"  Inference loop: {e}")
+                phantom_state["_last_yolo_log_time"] = time.time()
+        # No sleep — start next inference immediately after the last finishes
+
+
 async def _simple_yolo_loop():
-    """When Drone2 is not loaded: run Drone YOLO on laptop feed and fill phantom_state for UI + map."""
+    """20fps frame loop: overlays cached detections on the live camera frame."""
     import cv2
     while True:
         try:
             if _simple_camera_frame is None:
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.05)
                 continue
             frame = _simple_camera_frame.copy()
-            h, w = frame.shape[:2]
-            detections = _run_drone_yolo_on_frame(frame)
-            phantom_state["raw_detections"] = list(detections)
-            phantom_state["npu_provider"] = "CPUExecutionProvider"
-            phantom_state["yolo_latency_ms"] = 0.0
-            # Populate /api/detections for Drone2-style tactical map (map_x, map_y)
-            mapped1 = _map_detections_to_zone(detections, TACTICAL_ZONE_DRONE1, w, h)
-            mapped2 = _map_detections_to_zone(detections, TACTICAL_ZONE_DRONE2, w, h)
-            phantom_state["detections"]["Drone-1"] = mapped1
-            phantom_state["detections"]["Drone-2"] = mapped2
+
+            if not phantom_state.get("yolo_enabled", False):
+                phantom_state["raw_detections"] = []
+                phantom_state["detections"]["Drone-1"] = []
+                phantom_state["detections"]["Drone-2"] = []
             vis = frame.copy()
-            for d in detections:
-                bbox = d.get("bbox", [0, 0, 0, 0])
-                x1, y1, x2, y2 = [int(round(x)) for x in bbox]
-                cls = d.get("class", "?")
-                conf = d.get("confidence", 0)
-                cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 102), 2)
-                cv2.putText(vis, f"{cls} {conf:.0%}", (x1, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 102), 1)
+
             _, jpeg = cv2.imencode(".jpg", vis)
             phantom_state["processed_frames"]["Drone-1"] = jpeg.tobytes()
             phantom_state["processed_frames"]["Drone-2"] = jpeg.tobytes()
-        except Exception:
-            pass
-        await asyncio.sleep(0.2)
+        except Exception as e:
+            if phantom_state.get("_last_yolo_log_time", 0) < time.time() - 10:
+                print(f"  YOLO loop: {e}")
+                phantom_state["_last_yolo_log_time"] = time.time()
+        await asyncio.sleep(0.05)
 
 
 # Synthetic position for world graph when no real GPS (laptop webcam)
@@ -700,7 +868,7 @@ async def startup_event():
             phantom_yolo_detector = p["YOLODetector"](
                 str(_phantom_model_path),
                 qnn_dll_path=getattr(p["config"], "QNN_DLL_PATH", None),
-                confidence_threshold=getattr(p["config"], "YOLO_CONFIDENCE_THRESHOLD", 0.45),
+                confidence_threshold=0.25,  # lower so more objects show in frontend (was 0.45)
             )
             phantom_state["npu_provider"] = phantom_yolo_detector.get_provider()
             phantom_state["yolo_error"] = None
@@ -716,21 +884,34 @@ async def startup_event():
     elif _simple_capture is not None and _simple_capture.isOpened():
         _eager_load_drone_yolo()
         asyncio.create_task(_simple_yolo_loop())
+        asyncio.create_task(_inference_background_loop())
         print("  YOLO: Drone CPU (on laptop feed)")
+
+    # 2b) Depth Anything V2 — load alongside YOLO for real distance estimation
+    _eager_load_depth()
 
     # 3) World graph for tactical map: ingest laptop feed so map has nodes
     if _world_graph is not None and _simple_capture is not None and _simple_capture.isOpened():
         asyncio.create_task(_world_graph_ingest_loop())
         print("  World graph: ingesting (map will populate)")
 
-    # 4) Agent tab: load emergency manuals into vector DB (optional; backend must be on PYTHONPATH)
+    # 4) Agent tab: load emergency manuals into vector DB (data/ and data/emergency_manuals/)
     try:
+        from emergency_manuals import ensure_all_manuals
+        ensure_all_manuals()
         from backend.vector_db import load_manuals_from_data_dir
         n = load_manuals_from_data_dir()
+        manuals_dir = str(_DRONE2_ROOT / "data" / "emergency_manuals")
+        if Path(manuals_dir).is_dir():
+            n2 = load_manuals_from_data_dir(manuals_dir)
+            n += n2
         if n > 0:
             print(f"  Agent (vector DB): loaded {n} manual chunks")
     except Exception as e:
         print(f"  Agent (vector DB): skip ({e})")
+
+    # 5) Combined agent (spatial + knowledge): pre-load in background
+    asyncio.create_task(_agent_init_background())
 
     # Summary so you can see why webcam/YOLO might not show
     cam_ok = _simple_capture is not None and _simple_capture.isOpened()
@@ -847,6 +1028,144 @@ def get_graph():
     return _world_graph.get_graph()
 
 
+@app.get("/api/graph_3d")
+def get_graph_3d():
+    """3D Map tab: point cloud, path, nodes with poses, and stats."""
+    if _world_graph is None:
+        return {
+            "pointcloud": [],
+            "path": [],
+            "nodes": [],
+            "stats": {
+                "node_count": 0,
+                "point_count": 0,
+                "area_m2": 0.0,
+                "survivors": 0,
+                "hazards": 0,
+                "exits": 0,
+                "structural": 0,
+            },
+        }
+    try:
+        from pointcloud_builder import build_pointcloud
+        points = build_pointcloud(_world_graph)
+    except Exception:
+        points = _world_graph.to_3d_pointcloud()
+    ordered = sorted(_world_graph.nodes.keys())
+    path = []
+    nodes_payload = []
+    for node_id in ordered:
+        pos = _world_graph.get_pose_at_node(node_id)
+        if pos is not None:
+            path.append({"x": pos[0], "y": pos[1], "z": pos[2]})
+        n = _world_graph.nodes[node_id]
+        d = n.to_dict()
+        pos = _world_graph.get_pose_at_node(node_id)
+        d["pose"] = [float(pos[0]), float(pos[1]), float(pos[2])] if pos else None
+        d["structural_risk_score"] = 0.0  # placeholder
+        nodes_payload.append(d)
+    st = _world_graph.get_stats()
+    cc = st.get("category_counts", {})
+    return {
+        "pointcloud": [{"x": p[0], "y": p[1], "z": p[2], "r": p[3], "g": p[4], "b": p[5]} for p in points],
+        "path": path,
+        "nodes": nodes_payload,
+        "stats": {
+            "node_count": st.get("node_count", 0),
+            "point_count": len(points),
+            "area_m2": round(st.get("coverage_m2", 0), 2),
+            "survivors": cc.get("survivor", 0),
+            "hazards": cc.get("hazard", 0),
+            "exits": cc.get("exit", 0),
+            "structural": cc.get("structural", 0),
+        },
+    }
+
+
+@app.get("/api/graph_3d/neighbor")
+def get_graph_3d_neighbor(node_id: str, direction: str):
+    """Get neighbor node. direction: forward, back, left, right (spatial) or next, prev (video order)."""
+    wg = _get_world_graph()
+    if wg is None:
+        raise HTTPException(status_code=404, detail="No world graph")
+    if direction not in ("forward", "back", "left", "right", "next", "prev"):
+        raise HTTPException(status_code=400, detail="direction must be forward, back, left, right, next, or prev")
+    if direction in ("next", "prev"):
+        neighbor_id = wg.get_neighbor_by_order(node_id, direction)
+    else:
+        neighbor_id = wg.get_neighbor_direction(node_id, direction)
+    if neighbor_id is None:
+        raise HTTPException(status_code=404, detail="No neighbor in that direction")
+    n = wg.nodes[neighbor_id]
+    d = n.to_dict()
+    pos = wg.get_pose_at_node(neighbor_id)
+    d["pose"] = [float(pos[0]), float(pos[1]), float(pos[2])] if pos else None
+    d["structural_risk_score"] = 0.0
+    return {"node_id": neighbor_id, "node": d}
+
+
+@app.post("/api/import_video")
+@app.post("/api/import_video/")  # allow trailing slash so proxy/redirect doesn't turn POST into GET
+def import_video(file: Optional[UploadFile] = File(None, alias="file")):
+    """Upload video (MP4/AVI/MOV); process in background. Use multipart form with key 'file'."""
+    wg = _get_world_graph()
+    if wg is None:
+        raise HTTPException(status_code=400, detail="No world graph")
+    if file is None:
+        raise HTTPException(status_code=400, detail="No file in request. Send multipart form with field 'file'.")
+    filename = getattr(file, "filename", None) or ""
+    if not filename.strip():
+        raise HTTPException(status_code=400, detail="No file uploaded (empty filename)")
+    ext = (Path(filename).suffix or "").lower()
+    if ext not in (".mp4", ".avi", ".mov", ".mkv", ".webm"):
+        raise HTTPException(status_code=400, detail=f"Use MP4, AVI, MOV, MKV, or WEBM (e.g. YouTube downloads). Got: {ext or 'no extension'}")
+    import tempfile
+    from video_import import run_import_async, get_import_status
+    if get_import_status().get("status") == "running":
+        raise HTTPException(status_code=409, detail="Import already in progress")
+    try:
+        contents = file.file.read()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read file: {e}")
+    if not contents:
+        raise HTTPException(status_code=400, detail="File is empty")
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+    tmp.write(contents)
+    tmp.close()
+    run_import_async(tmp.name, wg)
+    return {"success": True, "message": "Import started. Poll /api/import_video/status for progress."}
+
+
+@app.get("/api/import_video/status")
+def import_video_status():
+    """Progress of video import: status, current, total, message."""
+    try:
+        from video_import import get_import_status
+        return get_import_status()
+    except Exception:
+        return {"status": "idle", "current": 0, "total": 0, "message": ""}
+
+
+@app.post("/api/export_vr")
+def export_vr():
+    """Export PLY + offline VR viewer HTML to exports/; copy three.min.js if needed. Returns URL to open."""
+    if _world_graph is None:
+        raise HTTPException(status_code=400, detail="No world graph")
+    try:
+        from vr_exporter import run_export
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="vr_exporter failed: " + str(e))
+    _EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    ply_path, html_path = run_export(_world_graph, str(_EXPORTS_DIR))
+    # Copy three.min.js from frontend node_modules if present
+    three_src = _PROJECT / "frontend" / "node_modules" / "three" / "build" / "three.min.js"
+    three_dst = _EXPORTS_DIR / "three.min.js"
+    if three_src.exists() and not three_dst.exists():
+        import shutil
+        shutil.copy2(three_src, three_dst)
+    return {"url": "/exports/vr_viewer.html", "success": True}
+
+
 @app.get("/api/status")
 def api_status():
     camera_ready = (
@@ -866,7 +1185,52 @@ def api_status():
         "camera_ready": camera_ready,
         "yolo_loaded": yolo_loaded,
         "yolo_error": yolo_error,
+        "depth_enabled": phantom_state.get("depth_enabled", False),
+        "depth_latency_ms": round(phantom_state.get("depth_latency_ms", 0), 1),
+        "depth_provider": phantom_state.get("depth_provider", "not loaded"),
     }
+
+
+@app.post("/api/yolo/start")
+def api_yolo_start():
+    phantom_state["yolo_enabled"] = True
+    return {"yolo_enabled": True}
+
+
+@app.post("/api/yolo/stop")
+def api_yolo_stop():
+    phantom_state["yolo_enabled"] = False
+    phantom_state["raw_detections"] = []
+    phantom_state["detections"] = {}
+    return {"yolo_enabled": False}
+
+
+@app.post("/api/yolo/frame")
+async def api_yolo_frame(request: Request):
+    """Run YOLO on a single JPEG frame (raw bytes in request body). Returns detections."""
+    body = await request.body()
+    if not body:
+        return JSONResponse({"detections": []})
+    try:
+        import cv2 as _cv2
+        import numpy as _np
+        nparr = _np.frombuffer(body, _np.uint8)
+        frame = _cv2.imdecode(nparr, _cv2.IMREAD_COLOR)
+        if frame is None:
+            return JSONResponse({"detections": []})
+        detections = _run_drone_yolo_on_frame(frame)
+        # Run depth alongside YOLO for stream mode
+        if _depth_estimator is not None and _depth_estimator.loaded and detections:
+            h, w = frame.shape[:2]
+            depth_map = _depth_estimator.infer(frame)
+            if depth_map is not None:
+                for d in detections:
+                    d["distance_meters"] = _depth_estimator.depth_at_bbox(
+                        depth_map, d.get("bbox", [0, 0, 1, 1]), w, h
+                    )
+        return JSONResponse({"detections": detections})
+    except Exception as e:
+        return JSONResponse({"detections": [], "error": str(e)})
 
 
 @app.get("/api/detections")
@@ -909,10 +1273,17 @@ def api_feed_processed(drone_id: str):
     # Prefer YOLO-overlay frame (from phantom_background_loop or _simple_yolo_loop)
     jpeg = phantom_state.get("processed_frames", {}).get(drone_id)
     if jpeg:
-        return Response(content=jpeg, media_type="image/jpeg")
+        return Response(
+            content=jpeg,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"},
+        )
     if _simple_camera_jpeg is not None:
-        return Response(content=_simple_camera_jpeg, media_type="image/jpeg")
-    # Avoid 503 flicker: serve placeholder until first frame is ready
+        return Response(
+            content=_simple_camera_jpeg,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "no-store"},
+        )
     if _placeholder_jpeg is not None:
         return Response(content=_placeholder_jpeg, media_type="image/jpeg")
     raise HTTPException(status_code=503, detail="Camera not available")
@@ -926,61 +1297,158 @@ def api_feed_processed(drone_id: str):
 def api_agent_response():
     """Last agent answer and node_ids for Agent tab UI."""
     r = phantom_state.get("agent_response", {})
-    return {"answer": r.get("answer", ""), "node_ids": r.get("node_ids", []), "ts": r.get("ts", 0)}
+    return {
+        "answer": r.get("answer", ""),
+        "node_ids": r.get("node_ids", []),
+        "ts": r.get("ts", 0),
+        "confidence": r.get("confidence", 0.75),
+        "agent_used": r.get("agent_used", "KNOWLEDGE"),
+        "recommended_action": r.get("recommended_action", ""),
+    }
+
+
+async def _run_voice_query_with_text(text: str):
+    """Run query_agent with transcribed/text query; update phantom_state; return response dict."""
+    _root = str(_DRONE2_ROOT)
+    _backend = str(_DRONE2_ROOT / "backend")
+    for p in (_root, _backend):
+        if p not in sys.path:
+            sys.path.insert(0, p)
+    try:
+        from backend.query_agent import query_agent
+    except ImportError:
+        import importlib.util
+        _qpath = _DRONE2_ROOT / "backend" / "query_agent.py"
+        _spec = importlib.util.spec_from_file_location("query_agent", _qpath, submodule_search_locations=[_backend])
+        _mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        query_agent = _mod.query_agent
+
+    spatial_answer = ""
+    spatial_node_ids = []
+    wg = _get_world_graph()
+    if wg is not None and getattr(wg, "nodes", None) and len(wg.nodes) >= 3:
+        q = text.lower()
+        spatial_triggers = ("where", "find", "locate", "show me", "in the feed", "spot", "which node", "which frame", "see the", "saw the", "was the", "extinguisher", "person", "exit", "door", "fire", "hazard")
+        if any(t in q for t in spatial_triggers):
+            nodes_with_frames = sum(1 for n in wg.nodes.values() if getattr(n, "image_b64", None))
+            if nodes_with_frames >= 2:
+                def _spatial_search():
+                    try:
+                        from clip_navigator import (
+                            find_best_node,
+                            find_top_k_nodes,
+                            describe_node,
+                            find_nodes_by_detection_class,
+                        )
+                        # 1) Prefer nodes where YOLO detections match the query (Manual/import frames)
+                        by_det = find_nodes_by_detection_class(text, wg)
+                        if by_det:
+                            best_id = by_det[0][0]
+                            top_ids = [nid for nid, _ in by_det[:3]]
+                            desc = describe_node(best_id, wg)
+                            return best_id, top_ids, desc
+                        # 2) Fall back to CLIP visual similarity
+                        best = find_best_node(text, wg)
+                        if best:
+                            top3 = find_top_k_nodes(text, wg, k=3)
+                            desc = describe_node(best, wg)
+                            return best, top3, desc
+                    except Exception:
+                        return None, [], ""
+                    return None, [], ""
+                loop = asyncio.get_event_loop()
+                best_id, top_ids, desc = await loop.run_in_executor(None, _spatial_search)
+                if best_id:
+                    spatial_node_ids = [best_id] + [n for n in top_ids if n != best_id][:2]
+                    spatial_answer = f"Found in the feed at this spot (see highlighted nodes below). {desc}"
+
+    # Only run knowledge (manuals/vector DB) when we don't have a spatial match — show just the answer to what was asked
+    answer = ""
+    node_ids: List[str] = []
+    confidence = 0.75
+    recommended_action = ""
+    agent_used = "KNOWLEDGE"
+    if spatial_answer:
+        # Spatial question answered from feed: return only that, no manual dump
+        answer = spatial_answer
+        node_ids = list(spatial_node_ids)
+        agent_used = "SPATIAL"
+        confidence = 0.9
+    else:
+        def _run():
+            get_graph_callback = _world_graph.get_graph if _world_graph else None
+            return query_agent(text, top_k=3, get_graph_callback=get_graph_callback)
+        result = await asyncio.get_event_loop().run_in_executor(None, _run)
+        answer = result.get("answer", "")
+        node_ids = list(result.get("node_ids", []))
+        confidence = float(result.get("confidence", 0.75))
+        recommended_action = (result.get("recommended_action") or "").strip()
+    phantom_state["agent_response"] = {
+        "answer": answer, "node_ids": node_ids, "text": text, "ts": time.time(),
+        "confidence": confidence, "agent_used": agent_used, "recommended_action": recommended_action,
+    }
+    return {
+        "answer": answer, "node_ids": node_ids, "text": text,
+        "confidence": confidence, "agent_used": agent_used, "recommended_action": recommended_action,
+    }
+
+
+@app.post("/api/voice_upload")
+async def api_voice_upload(audio: UploadFile = File(..., alias="audio")):
+    """Accept audio file (multipart form 'audio'); transcribe with Whisper and run tactical query. Use this for browser voice recording."""
+    try:
+        if str(_DRONE2_ROOT) not in sys.path:
+            sys.path.insert(0, str(_DRONE2_ROOT))
+        from backend.voice_input import transcribe_audio
+        wav_bytes = await audio.read()
+        if not wav_bytes or len(wav_bytes) == 0:
+            return {"answer": "Audio was empty. Record for a few seconds then click STOP.", "node_ids": [], "text": ""}
+        loop = asyncio.get_event_loop()
+        text = await loop.run_in_executor(None, transcribe_audio, wav_bytes)
+        if not (text or "").strip():
+            return {"answer": "No speech detected. Try speaking clearly and recording a bit longer.", "node_ids": [], "text": ""}
+        return await _run_voice_query_with_text((text or "").strip())
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"voice_upload: {e}", exc_info=True)
+        return {"answer": f"Voice failed: {e}. Install: pip install transformers soundfile pydub; for WebM install ffmpeg.", "node_ids": [], "text": ""}
 
 
 @app.post("/api/voice_query")
 async def api_voice_query(request: Request):
-    """Text or audio query: runs query_agent (vector DB + Genie). Returns answer and node_ids."""
+    """Text (JSON) or legacy multipart: runs query_agent. For browser voice, use POST /api/voice_upload with form 'audio'."""
     try:
-        content_type = request.headers.get("content-type", "")
+        content_type = (request.headers.get("content-type") or "").lower()
         text = ""
         if "application/json" in content_type:
             body = await request.json()
             text = (body.get("text") or "").strip()
         elif "multipart/form-data" in content_type:
             form = await request.form()
-            if "audio" in form:
+            upload = form.get("audio")
+            if upload is None:
+                for key in form:
+                    v = form[key]
+                    if hasattr(v, "read"):
+                        upload = v
+                        break
+            if upload is not None and hasattr(upload, "read"):
                 if str(_DRONE2_ROOT) not in sys.path:
                     sys.path.insert(0, str(_DRONE2_ROOT))
-                from backend.voice_input import record_and_transcribe, transcribe_audio
+                from backend.voice_input import transcribe_audio
                 loop = asyncio.get_event_loop()
-                file = form["audio"]
-                if file and hasattr(file, "read"):
-                    wav_bytes = await file.read()
-                    text = await loop.run_in_executor(None, transcribe_audio, wav_bytes)
-                else:
-                    text = await loop.run_in_executor(None, record_and_transcribe)
+                wav_bytes = await upload.read()
+                if not wav_bytes or len(wav_bytes) == 0:
+                    phantom_state["agent_response"] = {"answer": "Audio was empty. Record for a few seconds then stop.", "node_ids": [], "text": "", "ts": time.time()}
+                    return {"answer": phantom_state["agent_response"]["answer"], "node_ids": [], "text": ""}
+                text = await loop.run_in_executor(None, transcribe_audio, wav_bytes)
             else:
                 text = (form.get("text") or "").strip()
         if not text:
-            phantom_state["agent_response"] = {"answer": "No text or audio received.", "node_ids": [], "ts": time.time()}
-            return {"answer": phantom_state["agent_response"]["answer"], "node_ids": []}
-        # Ensure repo root and backend are on path so backend.query_agent and its submodules resolve
-        _root = str(_DRONE2_ROOT)
-        _backend = str(_DRONE2_ROOT / "backend")
-        for p in (_root, _backend):
-            if p not in sys.path:
-                sys.path.insert(0, p)
-        try:
-            from backend.query_agent import query_agent
-        except ImportError:
-            import importlib.util
-            _qpath = _DRONE2_ROOT / "backend" / "query_agent.py"
-            _spec = importlib.util.spec_from_file_location("query_agent", _qpath, submodule_search_locations=[_backend])
-            _mod = importlib.util.module_from_spec(_spec)
-            _spec.loader.exec_module(_mod)
-            query_agent = _mod.query_agent
-        def _run():
-            get_graph_callback = _world_graph.get_graph if _world_graph else None
-            return query_agent(text, top_k=3, get_graph_callback=get_graph_callback)
-        result = await asyncio.get_event_loop().run_in_executor(None, _run)
-        phantom_state["agent_response"] = {
-            "answer": result.get("answer", ""),
-            "node_ids": result.get("node_ids", []),
-            "ts": time.time(),
-        }
-        return {"answer": phantom_state["agent_response"]["answer"], "node_ids": phantom_state["agent_response"]["node_ids"]}
+            phantom_state["agent_response"] = {"answer": "No text or audio received. Use VOICE button and POST to /api/voice_upload, or send JSON { \"text\": \"...\" } to this endpoint.", "node_ids": [], "text": "", "ts": time.time()}
+            return {"answer": phantom_state["agent_response"]["answer"], "node_ids": [], "text": ""}
+        return await _run_voice_query_with_text(text)
     except Exception as e:
         import logging
         logging.getLogger(__name__).warning(f"voice_query: {e}", exc_info=True)
@@ -1005,6 +1473,54 @@ def api_sync_vector_graph():
         import logging
         logging.getLogger(__name__).warning(f"sync_vector_graph: {e}")
         return {"synced": 0}
+
+
+# ---------------------------------------------------------------------------
+# Combined agent (spatial + knowledge) for 3D Map AGENT mode
+# ---------------------------------------------------------------------------
+
+@app.get("/api/agent/status")
+def api_agent_status():
+    """Agent init status: ready, initializing, running. Last result highlights for tactical map."""
+    last = agent_state.get("last_result")
+    return {
+        "ready": agent_state.get("ready", False),
+        "initializing": agent_state.get("initializing", True),
+        "running": agent_state.get("running", False),
+        "highlighted_node_ids": getattr(last, "highlighted_node_ids", []) if last else [],
+    }
+
+
+class AgentRunBody(BaseModel):
+    query: str
+
+
+@app.post("/api/agent/run")
+async def api_agent_run(body: AgentRunBody):
+    """Run combined agent (spatial + knowledge). Returns answer, highlighted_node_ids, path_to_navigate, etc."""
+    wg = _get_world_graph()
+    if wg is None:
+        raise HTTPException(status_code=400, detail="No world graph")
+    agent_state["running"] = True
+    try:
+        from agent_orchestrator import run_agent
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: run_agent(body.query or "", wg))
+        agent_state["last_result"] = result
+        return {
+            "answer_text": result.answer_text,
+            "highlighted_node_ids": result.highlighted_node_ids,
+            "path_to_navigate": result.path_to_navigate,
+            "recommended_action": result.recommended_action,
+            "confidence": result.confidence,
+            "agent_used": result.agent_used,
+        }
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"agent/run: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        agent_state["running"] = False
 
 
 # ---------------------------------------------------------------------------
@@ -1075,13 +1591,13 @@ async def live_detections(run_llama: bool = False):
             yield f"data: {json.dumps({'type': 'waiting', 'message': 'Starting camera feed...'})}\n\n"
         except Exception as e:
             yield f"data: {json.dumps({'type': 'waiting', 'message': str(e)})}\n\n"
-        # Use laptop state whenever feeds are active (from _simple_yolo_loop or phantom_background_loop)
-        has_laptop_feed = bool(
-            phantom_state.get("feeds", {}).get("Drone-1")
-            or phantom_state.get("feeds", {}).get("Drone-2")
-            or (_simple_capture is not None and _simple_capture.isOpened())
-        )
         while True:
+            # Re-check on every iteration so we pick up the camera after it finishes starting
+            has_laptop_feed = bool(
+                phantom_state.get("feeds", {}).get("Drone-1")
+                or phantom_state.get("feeds", {}).get("Drone-2")
+                or (_simple_capture is not None and _simple_capture.isOpened())
+            )
             try:
                 # 1) Try iPhone stream first
                 try:
@@ -1111,7 +1627,7 @@ async def live_detections(run_llama: bool = False):
                                         "llama_description": llama_description,
                                     }
                                     yield f"data: {json.dumps(event)}\n\n"
-                                    await asyncio.sleep(0.2 if not run_llama else 2.0)
+                                    await asyncio.sleep(0.05 if not run_llama else 2.0)
                                     continue
                 except Exception:
                     pass
@@ -1119,6 +1635,9 @@ async def live_detections(run_llama: bool = False):
                 # 2) Laptop camera: use phantom_state (filled by YOLO loop)
                 if has_laptop_feed:
                     raw = phantom_state.get("raw_detections", [])
+                    # Fallback: use mapped detections for Drone-1 if raw not populated (same keys + map_x, map_y)
+                    if not raw:
+                        raw = phantom_state.get("detections", {}).get("Drone-1", [])
                     detections = [
                         {"class": d.get("class", "?"), "confidence": float(d.get("confidence", 0)), "bbox": list(d.get("bbox", [0, 0, 0, 0]))}
                         for d in raw
@@ -1126,7 +1645,7 @@ async def live_detections(run_llama: bool = False):
                     advisory = phantom_state.get("advisory", {})
                     llama_description = advisory.get("text", "") if run_llama else None
                     yield f"data: {json.dumps({'type': 'detections', 'timestamp': time.time(), 'detections': detections, 'detection_count': len(detections), 'llama_description': llama_description})}\n\n"
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(0.05)
                     continue
 
                 # 3) Simple laptop webcam fallback (no Drone2)
@@ -1147,7 +1666,7 @@ async def live_detections(run_llama: bool = False):
                         yield f"data: {json.dumps({'type': 'detections', 'timestamp': time.time(), 'detections': detections, 'detection_count': len(detections), 'llama_description': llama_description})}\n\n"
                     except Exception:
                         pass
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(0.05)
                     continue
 
                 yield f"data: {json.dumps({'type': 'waiting', 'message': 'No camera feed yet'})}\n\n"
@@ -1167,6 +1686,11 @@ async def live_detections(run_llama: bool = False):
 # ---------------------------------------------------------------------------
 # Serve Drone React UI (frontend/dist) — check at request time so no restart needed after build
 # ---------------------------------------------------------------------------
+
+# Serve VR export files (must be before catch-all)
+_EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/exports", StaticFiles(directory=str(_EXPORTS_DIR)), name="exports")
+
 
 @app.get("/")
 def serve_root():

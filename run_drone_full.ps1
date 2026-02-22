@@ -10,9 +10,10 @@ if (Test-Path "${env:ProgramFiles}\nodejs") { $env:Path = "${env:ProgramFiles}\n
 $conn = Get-NetTCPConnection -LocalPort 8000 -ErrorAction SilentlyContinue
 if ($conn) { $conn | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }; Start-Sleep -Seconds 1 }
 
-# Find Python: prefer real installs (avoid Windows Store "python" stub that says "Python was not found")
+# Find Python: prefer the C:\env venv (has ultralytics), then real installs
 $pythonExe = $null
 foreach ($p in @(
+    "C:\env\Scripts\python.exe",
     "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe",
     "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe",
     "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe",

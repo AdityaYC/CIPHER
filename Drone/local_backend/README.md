@@ -25,6 +25,15 @@ huggingface-cli login
 # Or download from Qualcomm AI Hub for optimized version
 ```
 
+**Depth (optional — for distance on minimap):**
+- **Qualcomm AI Hub:** Export Depth Anything V2 ONNX for NPU/CPU (recommended). From repo root:
+  ```bash
+  pip install qai-hub "qai-hub-models[depth_anything_v2_small_hf]"
+  python Drone/local_backend/get_depth_model.py
+  ```
+  Saves `models/depth_anything_v2_vits.onnx`. The backend uses it automatically at startup (see "Depth: Depth Anything V2 (Qualcomm AI Hub ONNX)" in logs).
+- **HuggingFace fallback:** If the ONNX is missing, the backend tries `depth-anything/Depth-Anything-V2-Small-hf` (requires `transformers`, `torch`). Depth estimates are shown on the tactical map and as "X.Xm" on detection boxes.
+
 ### 2. Hardware Requirements
 
 **Minimum:**
