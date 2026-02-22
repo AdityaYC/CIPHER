@@ -1605,6 +1605,9 @@ async def live_detections(run_llama: bool = False):
     async def event_stream():
         last_frame_time = None
         frame_counter = 0
+        _smooth_dets: list = []
+        _smooth_t: float = 0.0
+        _SMOOTH_TTL = 0.5
         # Send first event immediately so client gets 200 and doesn't trigger EventSource onerror
         try:
             yield f"data: {json.dumps({'type': 'waiting', 'message': 'Starting camera feed...'})}\n\n"
@@ -1663,8 +1666,15 @@ async def live_detections(run_llama: bool = False):
                             raw = models.detect_objects(image)
                         except Exception:
                             pass
+                    # Smooth: hold last non-empty detections for 500ms so boxes don't flicker
+                    _now = time.time()
+                    if raw:
+                        _smooth_dets = raw
+                        _smooth_t = _now
+                    elif _now - _smooth_t < _SMOOTH_TTL:
+                        raw = _smooth_dets
                     detections = [
-                        {"class": d.get("class", "?"), "confidence": float(d.get("confidence", 0)), "bbox": list(d.get("bbox", [0, 0, 0, 0]))}
+                        {"class": d.get("class", "?"), "confidence": float(d.get("confidence", 0)), "bbox": list(d.get("bbox", [0, 0, 0, 0])), "distance_meters": d.get("distance_meters")}
                         for d in raw
                     ]
                     advisory = phantom_state.get("advisory", {})
